@@ -110,12 +110,11 @@ var updater = {
 
     onError: function(response) {
         updater.errorSleepTime *= 2;
-        console.log("Poll error; sleeping for", updater.errorSleepTime, "ms");
         window.setTimeout(updater.poll, updater.errorSleepTime);
     },
 
     newMessages: function(response) {
-        if (!response.messages) return;
+        if (!response.messages || response.messages.length === 0) return;
         var messages = response.messages;
         updater.cursor = messages[messages.length - 1].id;
         console.log(messages.length, "new messages, cursor:", updater.cursor);

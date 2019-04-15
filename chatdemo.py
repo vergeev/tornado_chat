@@ -1,56 +1,42 @@
 # -*- coding: UTF-8 -*-
 
-import asyncio
 import os
+import queries
 import uuid
 
-from tornado import escape, ioloop, locks, web
+from tornado import escape, ioloop, gen, web
 from tornado.options import define, options, parse_command_line
 
 define('port', default=8888, help='run on the given port', type=int)  # noqa: Z432
 define('debug', default=True, help='run in debug mode')
 
 
-class MessageBuffer(object):
-
-    def __init__(self):
-        # cond is notified whenever the message cache is updated
-        self.cond = locks.Condition()
-        self.cache = []
-        self.cache_size = 200
-
-    def get_messages_since(self, cursor):
-        """Returns a list of messages newer than the given cursor.
-
-        ``cursor`` should be the ``id`` of the last message received.
-        """
-        messages = []
-        for msg in reversed(self.cache):
-            if cursor == msg['id']:
-                break
-            messages.append(msg)
-        messages.reverse()
-        return messages
-
-    def add_message(self, message):
-        self.cache.append(message)
-        if len(self.cache) > self.cache_size:
-            self.cache = self.cache[-self.cache_size:]
-        self.cond.notify_all()
-
-
-# Making this a non-singleton is left as an exercise for the reader.
-global_message_buffer = MessageBuffer()
-
-
 class MainHandler(web.RequestHandler):
+
+    def initialize(self):
+        self.session = queries.TornadoSession(
+            os.environ.get('DATABASE_URL')
+        )
+
+    @gen.coroutine
     def get(self):
-        self.render('index.html', messages=global_message_buffer.cache)
+        results = yield self.session.query(
+            'SELECT uuid as id, body, html FROM messages;',
+        )
+        messages = results.items()
+        results.free()
+        self.render('index.html', messages=messages)
 
 
 class MessageNewHandler(web.RequestHandler):
     """Post a new message to the chat room."""
 
+    def initialize(self):
+        self.session = queries.TornadoSession(
+            os.environ.get('DATABASE_URL')
+        )
+
+    @gen.coroutine
     def post(self):
         message = {'id': str(uuid.uuid4()), 'body': self.get_argument('body')}
         # render_string() returns a byte string, which is not supported
@@ -62,7 +48,17 @@ class MessageNewHandler(web.RequestHandler):
             self.redirect(self.get_argument('next'))
         else:
             self.write(message)
-        global_message_buffer.add_message(message)
+        try:
+            results = yield self.session.query(
+                'INSERT INTO messages (uuid, body, html) VALUES (%s, %s, %s);',
+                [message['id'], message['body'], message['html']]
+            )
+
+            results.free()
+        except (queries.DataError,
+                queries.IntegrityError) as error:
+            self.set_status(409)
+            self.finish({'error': {'error': error.pgerror.split('\n')[0][8:]}})
 
 
 class MessageUpdatesHandler(web.RequestHandler):
@@ -71,24 +67,40 @@ class MessageUpdatesHandler(web.RequestHandler):
     Waits until new messages are available before returning anything.
     """
 
-    async def post(self):
+    def initialize(self):
+        self.session = queries.TornadoSession(
+            os.environ.get('DATABASE_URL')
+        )
+
+    @gen.coroutine
+    def post(self):
         cursor = self.get_argument('cursor', None)
-        messages = global_message_buffer.get_messages_since(cursor)
-        while not messages:
-            # Save the Future returned here so we can cancel it in
-            # on_connection_close.
-            self.wait_future = global_message_buffer.cond.wait()
-            try:
-                await self.wait_future
-            except asyncio.CancelledError:
-                return
-            messages = global_message_buffer.get_messages_since(cursor)
-        if self.request.connection.stream.closed():
-            return
-        self.write({'messages': messages})
+        if cursor:
+            self.results = yield self.session.query(
+                'SELECT uuid as id, body, html FROM messages'
+                ' WHERE id > (SELECT id FROM messages WHERE uuid=%s LIMIT 1);',
+                [cursor]
+            )
+        else:
+            self.results = yield self.session.query(
+                'SELECT uuid as id, body, html FROM messages;'
+            )
+        if self.results:
+            messages = [
+                {
+                    'id': str(result['id']),
+                    'body': result['body'],
+                    'html': result['html'],
+                }
+                for result in self.results
+            ]
+            print({'messages': messages})
+            self.finish({'messages': messages})
+        self.results.free()
 
     def on_connection_close(self):
-        self.wait_future.cancel()
+        # if self.results:
+        self.results.free()
 
 
 def main():
